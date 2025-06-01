@@ -1,1 +1,4 @@
 vtk
+mediapipe
+scipy
+numpy

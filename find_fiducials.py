@@ -3,92 +3,350 @@ from mesh_helpers import read_as_vtkpolydata, get_mesh_actor
 import vtk
 import numpy as np
 import os
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from scipy import stats
 import argparse
+import warnings
 
 
 def find_fiducials(mesh: vtk.vtkPolyData) -> Fiducials:
     """
-    !!!YOUR CODE GOES HERE!!!
+    Find fiducials in a mesh using the full pipeline (MediaPipe + VTK rendering + 3D picking).
 
-    Find fiducials in a mesh.
+    NOTE: For full functionality (textured rendering), the mesh must be loaded from a .obj file
+    and the corresponding .mtl and texture (.png) files must be present in the same directory.
+    The function attempts to infer the file path by searching for a matching mesh in data/training/input_meshes.
+    If this fails, the pipeline will not work as intended and a clear error will be raised.
 
     Input:
-        mesh: vtkPolyData object representing the mesh.
-
+        mesh: vtkPolyData object representing the mesh (should be loaded from .obj file).
     Output:
         fiducials: Fiducials object containing the found fiducials.
-
-    This example is highly reductive and inaccurate, but demonstrates the flow of data through the function
     """
-    # get the positions of the mesh vertices
-    points = mesh.GetPoints()
-    num_points = points.GetNumberOfPoints()
-    arr = np.zeros((num_points, 3), dtype=np.float32)
-    for i in range(num_points):
-        p = points.GetPoint(i)
-        arr[i, 0] = p[0]
-        arr[i, 1] = p[1]
-        arr[i, 2] = p[2]
+    # --- Parameters ---
+    num_views = 16
+    image_size = 800
+    sweep_size = 5
+    filter_thresh = 1.0
+    model_path = os.path.join("mediapipe", "face_landmarker.task")
+    
+    """
+    MediaPipe landmark index and fiducial ID mapping
+    First number: MediaPipe face landmark index for detection
+    Second number: Fiducial ID (999 is placeholder, can be changed if needed)
+    NOTE: 999 used due to discrepancies between ground truth and template JSON IDs
+    """
+    landmark_map = {
+        "left_ear": (234, 999),
+        "left_eye_outside": (130, 999),
+        "left_eye_inside": (133, 999),
+        "nasion": (168, 999),
+        "right_eye_inside": (362, 999),
+        "right_eye_outside": (359, 999),
+        "right_ear": (454, 999),
+    }
 
-    # Analyze the mesh vertices to find fiducials
-    # This is a placeholder for your actual logic to find fiducials.
-    center = np.mean(arr, axis=0)
-    pmax = np.max(arr, axis=0)
-    pmin = np.min(arr, axis=0)
-    size = pmax - pmin
-    ravg = np.mean(size)
-    arr_centered = arr - center
-    r_lp = np.sqrt(arr_centered[:, 0] ** 2 + arr_centered[:, 1] ** 2)
-    r_ps = np.sqrt(arr_centered[:, 1] ** 2 + arr_centered[:, 2] ** 2)
-    ps = arr[r_lp < ravg / 30, :]
-    pl = arr[r_ps < ravg / 30, :]
-    nasion = ps[np.argmax(ps[:, 2]), :]
-    nasion_r = np.sqrt(np.sum((nasion - center) ** 2))
-    left_ear = pl[np.argmax(pl[:, 0]), :]
-    left_ear_r = np.sqrt(np.sum((left_ear - center) ** 2))
-    right_ear = pl[np.argmin(pl[:, 0]), :]
-    right_ear_r = np.sqrt(np.sum((right_ear - center) ** 2))
-    left_eye_outside = left_ear * 0.5 + nasion * 0.5
-    left_eye_outside_r = np.sqrt(np.sum((left_eye_outside - center) ** 2))
-    left_eye_outside = (
-        (left_eye_outside - center)
-        * (left_ear_r * 0.5 + nasion_r * 0.5)
-        / left_eye_outside_r
-    ) + center
-    left_eye_inside = left_ear * 0.25 + nasion * 0.75
-    left_eye_inside_r = np.sqrt(np.sum((left_eye_inside - center) ** 2))
-    left_eye_inside = (
-        (left_eye_inside - center)
-        * (left_ear_r * 0.25 + nasion_r * 0.75)
-        / left_eye_inside_r
-    ) + center
-    right_eye_outside = right_ear * 0.5 + nasion * 0.5
-    right_eye_outside_r = np.sqrt(np.sum((right_eye_outside - center) ** 2))
-    right_eye_outside = (
-        (right_eye_outside - center)
-        * (right_ear_r * 0.5 + nasion_r * 0.5)
-        / right_eye_outside_r
-    ) + center
-    right_eye_inside = right_ear * 0.25 + nasion * 0.75
-    right_eye_inside_r = np.sqrt(np.sum((right_eye_inside - center) ** 2))
-    right_eye_inside = (
-        (right_eye_inside - center)
-        * (right_ear_r * 0.25 + nasion_r * 0.75)
-        / right_eye_inside_r
-    ) + center
+    # --- Helper: Guess mesh file path by matching points ---
+    def guess_mesh_path_from_points(mesh):
+        data_dir = os.path.join("data", "training", "input_meshes")
+        if not os.path.isdir(data_dir):
+            return None
+        mesh_points = mesh.GetPoints()
+        num_points = mesh_points.GetNumberOfPoints()
+        mesh_arr = np.array([mesh_points.GetPoint(i) for i in range(num_points)])
+        for fname in os.listdir(data_dir):
+            if not fname.endswith(".obj"):
+                continue
+            candidate_path = os.path.join(data_dir, fname)
+            try:
+                candidate_mesh = read_as_vtkpolydata(candidate_path)
+                c_points = candidate_mesh.GetPoints()
+                if c_points.GetNumberOfPoints() != num_points:
+                    continue
+                c_arr = np.array([c_points.GetPoint(i) for i in range(num_points)])
+                # Use a quick hash or mean check for speed
+                if np.allclose(np.mean(mesh_arr, axis=0), np.mean(c_arr, axis=0), atol=1e-5):
+                    if np.allclose(mesh_arr, c_arr, atol=1e-5):
+                        return candidate_path
+            except Exception:
+                continue
+        return None
 
-    # Create the Fiducials object and populate the control points
-    fiducials = Fiducials(color=[0, 1, 0])
-    fiducials.control_points.append(ControlPoint(left_ear, "left_ear"))
-    fiducials.control_points.append(ControlPoint(left_eye_outside, "left_eye_outside"))
-    fiducials.control_points.append(ControlPoint(left_eye_inside, "left_eye_inside"))
-    fiducials.control_points.append(ControlPoint(nasion, "nasion"))
-    fiducials.control_points.append(ControlPoint(right_eye_inside, "right_eye_inside"))
-    fiducials.control_points.append(
-        ControlPoint(right_eye_outside, "right_eye_outside")
+    # --- Infer mesh file path (required for .mtl and texture) ---
+    mesh_path = guess_mesh_path_from_points(mesh)
+    if mesh_path is None or not os.path.isfile(mesh_path):
+        raise RuntimeError("Could not infer mesh file path from input mesh. Please ensure the mesh is loaded from a .obj file in data/training/input_meshes and is unmodified. Textured rendering and picking require the original file. If you are running on a different dataset, update the search path in find_fiducials.")
+    mesh_base = os.path.splitext(os.path.basename(mesh_path))[0]
+    mtl_path = os.path.join(os.path.dirname(mesh_path), mesh_base + ".mtl")
+    texture_path = os.path.join(os.path.dirname(mesh_path))
+
+    # --- Setup MediaPipe detector ---
+    base_options = python.BaseOptions(model_asset_path=model_path)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        num_faces=1,
+        min_face_detection_confidence=0.7,
+        min_face_presence_confidence=0.7,
+        min_tracking_confidence=0.7
     )
-    fiducials.control_points.append(ControlPoint(right_ear, "right_ear"))
+    detector = vision.FaceLandmarker.create_from_options(options)
+    mp_face_detection = mp.solutions.face_detection
+    testdetector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.95)
 
+    # --- Find viable Z rotations ---
+    def find_viable_z_rots(mesh_path, detector, stepZ=sweep_size, verbose=False, image_size=image_size):
+        window = vtk.vtkRenderWindow()
+        window.SetOffScreenRendering(1)
+        window.SetSize(image_size, image_size)
+        renderer = vtk.vtkRenderer()
+        window.AddRenderer(renderer)
+        lights = [
+            {'pos': (0, 0, 1), 'color': (1, 1, 1)},
+            {'pos': (0, 1, 0), 'color': (0.5, 0.5, 0.5)},
+            {'pos': (1, 0, 0), 'color': (0.3, 0.3, 0.3)},
+            {'pos': (-1, 0, 0), 'color': (0.3, 0.3, 0.3)}
+        ]
+        for light_cfg in lights:
+            light = vtk.vtkLight()
+            light.SetPosition(*light_cfg['pos'])
+            light.SetFocalPoint(0, 0, 0)
+            light.SetColor(*light_cfg['color'])
+            light.SetIntensity(1.2)
+            renderer.AddLight(light)
+        importer = vtk.vtkOBJImporter()
+        importer.SetFileName(mesh_path)
+        importer.SetFileNameMTL(mtl_path)
+        importer.SetTexturePath(texture_path)
+        importer.SetRenderWindow(window)
+        importer.Update()
+        renderer.SetBackground(1, 1, 1)
+        prevDetect = False
+        prevprevDetect = False
+        minZrot = 0
+        maxZrot = 0
+        currZ = 0
+        numsteps = round(360/stepZ)
+        for z in range(numsteps):
+            renderer.ResetCamera()
+            renderer.GetActiveCamera().Zoom(1.0)
+            renderer.GetActiveCamera().OrthogonalizeViewUp()
+            renderer.GetActiveCamera().Azimuth(stepZ)
+            currZ = currZ + stepZ
+            renderer.ResetCameraClippingRange()
+            window.Render()
+            windowToImageFilter = vtk.vtkWindowToImageFilter()
+            windowToImageFilter.SetInput(window)
+            windowToImageFilter.Update()
+            vtk_image = windowToImageFilter.GetOutput()
+            scalars = vtk_image.GetPointData().GetScalars()
+            image = np.frombuffer(scalars, dtype=np.uint8)
+            image = image.reshape(image_size, image_size, 3)
+            image = np.flipud(image)
+            # Patch: ensure correct format for MediaPipe
+            if image.shape[-1] > 3:
+                image = image[..., :3]
+            image = np.ascontiguousarray(image, dtype=np.uint8)
+            rgb_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+            detection_result = detector.detect(rgb_frame)
+            currDetect = bool(detection_result.face_landmarks)
+            if prevprevDetect and (not prevDetect) and (not currDetect):
+                maxZrot = currZ-2*stepZ
+                break
+            prevprevDetect = prevDetect
+            prevDetect = currDetect
+        prevDetect = False
+        prevprevDetect = False
+        currZ = maxZrot
+        for z in range(numsteps):
+            renderer.ResetCamera()
+            renderer.GetActiveCamera().Zoom(1.0)
+            renderer.GetActiveCamera().OrthogonalizeViewUp()
+            renderer.GetActiveCamera().Azimuth(-stepZ)
+            currZ = currZ - stepZ
+            renderer.ResetCameraClippingRange()
+            window.Render()
+            windowToImageFilter = vtk.vtkWindowToImageFilter()
+            windowToImageFilter.SetInput(window)
+            windowToImageFilter.Update()
+            vtk_image = windowToImageFilter.GetOutput()
+            scalars = vtk_image.GetPointData().GetScalars()
+            image = np.frombuffer(scalars, dtype=np.uint8)
+            image = image.reshape(image_size, image_size, 3)
+            image = np.flipud(image)
+            # Patch: ensure correct format for MediaPipe
+            if image.shape[-1] > 3:
+                image = image[..., :3]
+            image = np.ascontiguousarray(image, dtype=np.uint8)
+            rgb_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+            detection_result = detector.detect(rgb_frame)
+            currDetect = bool(detection_result.face_landmarks)
+            if prevprevDetect and (not prevDetect) and (not currDetect):
+                minZrot = currZ+2*stepZ
+                break
+            prevprevDetect = prevDetect
+            prevDetect = currDetect
+        return maxZrot, minZrot
+
+    maxZrot, minZrot = find_viable_z_rots(mesh_path, detector, sweep_size, False, image_size)
+    z_rotations = np.linspace(minZrot, maxZrot, num_views)
+
+    # --- Render all views ---
+    def render_images_all(mesh_path, z_rotations, image_size=image_size):
+        images = []
+        stepZ = z_rotations[1] - z_rotations[0]
+        window = vtk.vtkRenderWindow()
+        window.SetOffScreenRendering(1)
+        window.SetSize(image_size, image_size)
+        renderer = vtk.vtkRenderer()
+        window.AddRenderer(renderer)
+        lights = [
+            {'pos': (0, 0, 1), 'color': (1, 1, 1)},
+            {'pos': (0, 1, 0), 'color': (0.5, 0.5, 0.5)},
+            {'pos': (1, 0, 0), 'color': (0.3, 0.3, 0.3)},
+            {'pos': (-1, 0, 0), 'color': (0.3, 0.3, 0.3)}
+        ]
+        for light_cfg in lights:
+            light = vtk.vtkLight()
+            light.SetPosition(*light_cfg['pos'])
+            light.SetFocalPoint(0, 0, 0)
+            light.SetColor(*light_cfg['color'])
+            light.SetIntensity(1.2)
+            renderer.AddLight(light)
+        importer = vtk.vtkOBJImporter()
+        importer.SetFileName(mesh_path)
+        importer.SetFileNameMTL(mtl_path)
+        importer.SetTexturePath(texture_path)
+        importer.SetRenderWindow(window)
+        importer.Update()
+        renderer.SetBackground(1, 1, 1)
+        renderer.ResetCamera()
+        renderer.GetActiveCamera().Zoom(1.0)
+        renderer.GetActiveCamera().OrthogonalizeViewUp()
+        renderer.GetActiveCamera().Azimuth(z_rotations[0] - stepZ)
+        for z in z_rotations:
+            renderer.ResetCamera()
+            renderer.GetActiveCamera().Zoom(1.0)
+            renderer.GetActiveCamera().OrthogonalizeViewUp()
+            renderer.GetActiveCamera().Azimuth(stepZ)
+            renderer.ResetCameraClippingRange()
+            window.Render()
+            windowToImageFilter = vtk.vtkWindowToImageFilter()
+            windowToImageFilter.SetInput(window)
+            windowToImageFilter.Update()
+            vtk_image = windowToImageFilter.GetOutput()
+            scalars = vtk_image.GetPointData().GetScalars()
+            image = np.frombuffer(scalars, dtype=np.uint8)
+            image = image.reshape(image_size, image_size, 3)
+            image = np.flipud(image)
+            # Patch: ensure correct format for MediaPipe
+            if image.shape[-1] > 3:
+                image = image[..., :3]
+            image = np.ascontiguousarray(image, dtype=np.uint8)
+            images.append(image)
+        return np.stack(images, axis=0)
+
+    images = render_images_all(mesh_path, z_rotations, image_size)
+
+    # --- Extract fiducials ---
+    fiducial_points = {label: [] for label in landmark_map}
+    picker = vtk.vtkCellPicker()
+    picker.SetTolerance(0.005)
+    stepZ = z_rotations[1] - z_rotations[0]
+    window = vtk.vtkRenderWindow()
+    window.SetOffScreenRendering(1)
+    window.SetSize(image_size, image_size)
+    renderer = vtk.vtkRenderer()
+    window.AddRenderer(renderer)
+    importer = vtk.vtkOBJImporter()
+    importer.SetFileName(mesh_path)
+    importer.SetFileNameMTL(mtl_path)
+    importer.SetTexturePath(texture_path)
+    importer.SetRenderWindow(window)
+    importer.Update()
+    renderer.SetBackground(1, 1, 1)
+    renderer.ResetCamera()
+    renderer.GetActiveCamera().Zoom(1.0)
+    renderer.GetActiveCamera().OrthogonalizeViewUp()
+    renderer.GetActiveCamera().Azimuth(z_rotations[0] - stepZ)
+    renderer.ResetCameraClippingRange()
+    window.Render()
+    currZ = z_rotations[0]
+    middleZ = (z_rotations[-1] + z_rotations[0]) / 2
+    for view_id in range(num_views):
+        image = images[view_id]
+        # Patch: ensure correct format for MediaPipe
+        if image.shape[-1] > 3:
+            image = image[..., :3]
+        image = np.ascontiguousarray(image, dtype=np.uint8)
+        rgb_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+        detection_result = detector.detect(rgb_frame)
+        testdetector_results = testdetector.process(image)
+        renderer.ResetCamera()
+        renderer.GetActiveCamera().Zoom(1.0)
+        renderer.GetActiveCamera().OrthogonalizeViewUp()
+        renderer.GetActiveCamera().Azimuth(stepZ)
+        renderer.ResetCameraClippingRange()
+        window.Render()
+        currZ = currZ + stepZ
+        if not detection_result.face_landmarks:
+            continue
+        face_landmarks = detection_result.face_landmarks[0]
+        h, w, _ = image.shape
+        for label, (mp_idx, fid_id) in landmark_map.items():
+            lm = face_landmarks[mp_idx]
+            image_x, image_y = float(lm.x * w), float(lm.y * h)
+            y_vtk = image_size - image_y
+            # Special handling for tragion
+            if label == "left_ear":
+                if not testdetector_results.detections:
+                    continue
+                if currZ < middleZ - 15:
+                    continue
+                for detection in testdetector_results.detections:
+                    Earpoint = mp_face_detection.get_key_point(detection, mp_face_detection.FaceKeyPoint.LEFT_EAR_TRAGION)
+                image_x, image_y = float(Earpoint.x * w), float(Earpoint.y * h)
+                y_vtk = image_size - image_y
+            elif label == "right_ear":
+                if not testdetector_results.detections:
+                    continue
+                if currZ > middleZ + 15:
+                    continue
+                for detection in testdetector_results.detections:
+                    Earpoint = mp_face_detection.get_key_point(detection, mp_face_detection.FaceKeyPoint.RIGHT_EAR_TRAGION)
+                image_x, image_y = float(Earpoint.x * w), float(Earpoint.y * h)
+                y_vtk = image_size - image_y
+            picker.Pick(image_x, y_vtk, 0, renderer)
+            point_3d = picker.GetPickPosition()
+            if point_3d is not None:
+                fiducial_points[label].append(point_3d)
+
+    # --- Filter fiducials ---
+    avg_points = {}
+    for label, points in fiducial_points.items():
+        points = np.array(points)
+        if points.size == 0:
+            warnings.warn(f"No points found for fiducial '{label}'. Skipping this label.")
+            continue
+        if len(points) == 1:
+            avg_point = points[0]
+        else:
+            z_scores = np.abs(stats.zscore(points))
+            mask = (z_scores < filter_thresh).all(axis=1)
+            if not np.any(mask):
+                warnings.warn(f"All points for fiducial '{label}' filtered out as outliers. Using unfiltered mean.")
+                avg_point = np.mean(points, axis=0)
+            else:
+                avg_point = np.mean(points[mask], axis=0)
+        avg_points[label] = avg_point.tolist()
+
+    # --- Build Fiducials object ---
+    # Create the Fiducials object and populate the control points in the original style
+    fiducials = Fiducials(color=[0, 1, 0])
+    for label, (_, fid_id) in landmark_map.items():
+        if label in avg_points:
+            fiducials.control_points.append(ControlPoint(avg_points[label], label, id=fid_id))
     return fiducials
 
 
